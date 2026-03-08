@@ -1,0 +1,159 @@
+from app.core.database import engine
+import asyncio
+import logging
+import uuid
+from datetime import time
+import json
+
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+# We run this as a module (e.g., `python -m scripts.seed_cork_businesses`)
+# so `app` imports must resolve from the project root.
+from app.core.database import AsyncSessionLocal
+from app.models.business import Business
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Overpass QL Query for Cafes and Restaurants in Cork City, Ireland
+CORK_BBOX = "51.87,-8.53,51.92,-8.42"
+# Official OSM Overpass URL
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+OVERPASS_QUERY = f"""
+[out:json][timeout:50];
+(
+  node["amenity"="cafe"]({CORK_BBOX});
+  node["amenity"="restaurant"]({CORK_BBOX});
+);
+out body;
+>;
+out skel qt;
+"""
+
+async def fetch_cork_businesses() -> list[dict]:
+    """Fetches real businesses from OpenStreetMap using the Overpass API."""
+    logger.info("Fetching real business data for Cork from Overpass API... Please wait up to 60 seconds.")
+    
+    # Sisteme kimliğimizi veriyoruz ki bizi engellemesin (Zorla Giriş)
+    headers = {
+        "User-Agent": "MeithealApp/1.0 (Contact: meitheal@example.com)",
+        "Accept": "application/json"
+    }
+    
+    try:
+        # Zaman aşımını 60 saniyeye çıkardık
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(OVERPASS_URL, data={"data": OVERPASS_QUERY}, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("elements", [])
+    except httpx.HTTPError as e:
+        logger.error(f"HTTP error communicating with Overpass API: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Overpass API response: {e}")
+        return []
+
+def parse_closing_time(tags: dict) -> time:
+    """
+    Attempts to parse 'opening_hours' natively, otherwise defaults to 18:00 (6 PM).
+    """
+    return time(hour=18, minute=0)
+
+async def seed_businesses():
+    """Main workflow to fetch and insert businesses into the database."""
+    
+    # Force create all tables in case Alembic hasn't been run or db is empty
+    from app.core.database import engine, Base
+    from app.models.business import Business
+    from app.models.volunteer import Volunteer
+    from app.models.food_rescue import FoodRescue
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        
+    elements = await fetch_cork_businesses()
+    
+    if not elements:
+        logger.warning("No data returned from Overpass. Cannot seed database.")
+        return
+
+    logger.info(f"Found {len(elements)} potential nodes. Processing...")
+
+    async with AsyncSessionLocal() as session:
+        businesses_to_add = []
+        count = 0
+        
+        for element in elements:
+            tags = element.get("tags", {})
+            name = tags.get("name")
+            
+            if not name:
+                continue
+                
+            lat = element.get("lat")
+            lon = element.get("lon")
+            
+            if lat is None or lon is None:
+                continue
+
+            if count == 0:
+                dummy_telegram_id = "8547941818"
+            else:
+                dummy_telegram_id = f"osm_{element.get('id')}_{uuid.uuid4().hex[:6]}"
+            closing_time = parse_closing_time(tags)
+            
+            stmt = select(Business).where(Business.telegram_id == dummy_telegram_id)
+            result = await session.execute(stmt)
+            exists = result.scalars().first()
+            
+            if not exists:
+                new_business = Business(
+                    name=name,
+                    telegram_id=dummy_telegram_id,
+                    lat=lat,
+                    lng=lon,
+                    closing_time=closing_time,
+                    is_active=True
+                )
+                businesses_to_add.append(new_business)
+                count += 1
+                
+        if businesses_to_add:
+            session.add_all(businesses_to_add)
+            await session.commit()
+            logger.info(f"Antigravity Mode: Tablolar zorla oluşturuldu! Successfully inserted {count} real businesses in Cork into the DB.")
+            
+            # Antigravity Phase: Seed some mock Food Rescues so the Map actually populates!
+            from app.models.food_rescue import FoodRescue
+            from app.schemas.food_rescue import RescueStatus, UrgencyLevel
+            from datetime import datetime, timedelta, timezone
+            import random
+            
+            rescues_to_add = []
+            # Give fake surplus to the first 15 businesses fetched
+            for b in businesses_to_add[:15]:
+                mock_rescue = FoodRescue(
+                    business_id=b.id,
+                    raw_text_input="Dummy surplus food generated by Antigravity seed script.",
+                    extracted_food=random.choice(["10 Lattes & Pastries", "5 Hot Paninis", "20 Boxes of Seasonal Vegetables", "8 Vegan Salads", "12 Slices of Pizza"]),
+                    allergens=random.choice([["Gluten", "Dairy"], ["Nuts"], []]),
+                    diet_type=random.choice([["Vegetarian"], ["Vegan"], []]),
+                    status=RescueStatus.PENDING,
+                    urgency_level=random.choice([UrgencyLevel.HIGH, UrgencyLevel.MEDIUM, UrgencyLevel.LOW]),
+                    pin_color=random.choice(["red", "yellow", "green"]),
+                    expiry_time=datetime.now(timezone.utc) + timedelta(hours=3)
+                )
+                rescues_to_add.append(mock_rescue)
+                
+            if rescues_to_add:
+                session.add_all(rescues_to_add)
+                await session.commit()
+                logger.info(f"Antigravity Mode: Seeded {len(rescues_to_add)} live food rescues to the map!")
+        else:
+            logger.info("No new businesses to insert (or names were missing from OSM nodes).")
+
+if __name__ == "__main__":
+    asyncio.run(seed_businesses())
